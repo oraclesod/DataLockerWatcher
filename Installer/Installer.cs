@@ -2,6 +2,7 @@ using Microsoft.Win32;
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 
 namespace DataLockerWatcherInstall
 {
@@ -36,12 +37,38 @@ namespace DataLockerWatcherInstall
         private const string IconIcoFileName = "DataLocker.ico";
         private const string IconPngFileName = "DataLocker.png";
 
+        private static readonly TimeSpan UpgradeSyncWaitTimeout = TimeSpan.FromMinutes(10);
+        private static readonly TimeSpan UpgradeSyncPollInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan AgentStopWaitTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan AgentStopPollInterval = TimeSpan.FromSeconds(1);
+
         public int InstallOrRepair(bool repair)
         {
             Directory.CreateDirectory(InstallDir);
             AppendInstallLog($"{(repair ? "Repair" : "Install")} started.");
 
             EnsureEventLogSources();
+
+            bool existingInstallDetected =
+                File.Exists(Path.Combine(InstallDir, AgentExeName)) ||
+                File.Exists(Path.Combine(InstallDir, SyncExeName));
+
+            if (existingInstallDetected)
+            {
+                LogInstallEvent("Existing installation detected. Preparing upgrade flow.");
+
+                if (!WaitForSyncToExit(UpgradeSyncWaitTimeout))
+                {
+                    LogInstallEvent(
+                        $"Upgrade aborted because Sync did not exit within {UpgradeSyncWaitTimeout.TotalMinutes:0} minutes.",
+                        EventLogEntryType.Error);
+
+                    AppendInstallLog("Upgrade aborted: Sync still running after timeout.");
+                    return 1;
+                }
+
+                StopAgentProcesses();
+            }
 
             // Copy payloads
             CopyPayload(InstallExeName, overwrite: true); // special: copies the currently running installer
@@ -171,6 +198,104 @@ namespace DataLockerWatcherInstall
             return 0;
         }
 
+        private bool WaitForSyncToExit(TimeSpan timeout)
+        {
+            var sw = Stopwatch.StartNew();
+            bool firstLog = true;
+
+            while (sw.Elapsed < timeout)
+            {
+                Process[] syncProcesses = Array.Empty<Process>();
+
+                try
+                {
+                    syncProcesses = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(SyncExeName));
+                    if (syncProcesses.Length == 0)
+                    {
+                        LogInstallEvent("No running Sync process detected.");
+                        return true;
+                    }
+
+                    if (firstLog)
+                    {
+                        LogInstallEvent(
+                            $"Sync is currently running ({syncProcesses.Length} instance(s)); waiting up to {timeout.TotalMinutes:0} minutes for it to finish.");
+                        firstLog = false;
+                    }
+                    else
+                    {
+                        LogInstallEvent(
+                            $"Sync still running ({syncProcesses.Length} instance(s)); waited {Math.Floor(sw.Elapsed.TotalSeconds):0}s so far...");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogInstallEvent($"Error while checking for Sync processes: {ex}", EventLogEntryType.Warning);
+                }
+                finally
+                {
+                    foreach (var p in syncProcesses)
+                    {
+                        try { p.Dispose(); } catch { }
+                    }
+                }
+
+                Thread.Sleep(UpgradeSyncPollInterval);
+            }
+
+            LogInstallEvent(
+                $"Timed out waiting for Sync to finish after {timeout.TotalMinutes:0} minutes.",
+                EventLogEntryType.Warning);
+
+            return false;
+        }
+
+        private void StopAgentProcesses()
+        {
+            try
+            {
+                LogInstallEvent("Stopping Agent process(es) before upgrade...");
+                TryRunSystem("taskkill.exe", $"/IM \"{AgentExeName}\" /F");
+            }
+            catch (Exception ex)
+            {
+                LogInstallEvent($"taskkill for Agent threw an exception: {ex}", EventLogEntryType.Warning);
+            }
+
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed < AgentStopWaitTimeout)
+            {
+                Process[] agents = Array.Empty<Process>();
+
+                try
+                {
+                    agents = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(AgentExeName));
+                    if (agents.Length == 0)
+                    {
+                        LogInstallEvent("Agent process(es) stopped.");
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogInstallEvent($"Error while checking for Agent processes: {ex}", EventLogEntryType.Warning);
+                }
+                finally
+                {
+                    foreach (var p in agents)
+                    {
+                        try { p.Dispose(); } catch { }
+                    }
+                }
+
+                Thread.Sleep(AgentStopPollInterval);
+            }
+
+            LogInstallEvent(
+                $"Agent still appears to be running after waiting {AgentStopWaitTimeout.TotalSeconds:0} seconds.",
+                EventLogEntryType.Warning);
+        }
+
         private bool TryStartAgentFallback(string agentPath, out string? error)
         {
             error = null;
@@ -234,35 +359,31 @@ namespace DataLockerWatcherInstall
             var dst = Path.Combine(InstallDir, fileName);
 
             if (!File.Exists(src))
-                throw new FileNotFoundException($"Missing payload: {src}");
+                throw new FileNotFoundException($"Required payload not found: {src}");
 
-            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
             File.Copy(src, dst, overwrite);
         }
 
         private void CopyPayloadIfExists(string fileName, bool overwrite)
         {
             var src = GetPayloadSourcePath(fileName, allowMissing: true);
-            if (src == null || !File.Exists(src)) return;
+            if (!File.Exists(src))
+                return;
 
             var dst = Path.Combine(InstallDir, fileName);
-            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
             File.Copy(src, dst, overwrite);
         }
 
         /// <summary>
         /// Resolve the source file on disk for a payload.
         /// Special-case: Install.exe should be the currently running installer EXE,
-        /// even if the built filename is different (e.g., DataLockerWatcherInstall.exe).
+        /// even if the built filename is different.
         /// </summary>
         private string GetPayloadSourcePath(string fileName, bool allowMissing = false)
         {
             if (string.Equals(fileName, InstallExeName, StringComparison.OrdinalIgnoreCase))
             {
-                // Best option on .NET 6+ (and .NET 8): the actual process EXE path
                 var exePath = Environment.ProcessPath;
-
-                // Fallback for edge cases; works with single-file
                 exePath ??= Process.GetCurrentProcess().MainModule?.FileName;
 
                 if (string.IsNullOrWhiteSpace(exePath))
@@ -271,13 +392,12 @@ namespace DataLockerWatcherInstall
                 return exePath;
             }
 
-            // Default: payload expected alongside installer in its launch directory
             var candidate = Path.Combine(SourceDir, fileName);
 
             if (!allowMissing)
                 return candidate;
 
-            return File.Exists(candidate) ? candidate : candidate;
+            return candidate;
         }
 
         private void SafeDelete(string path)
