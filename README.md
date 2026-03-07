@@ -133,7 +133,7 @@ Example:
     "ToastOnDetected": true
   },
   "Sync": {
-    "Source": "\\fileserver\secure-share\Data",
+    "Source": "\\\\fileserver\\secure-share\\Data",
     "TargetFolder": "Data",
     "Mode": 1,
     "Key": ""
